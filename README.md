@@ -1,0 +1,1 @@
+# strip-photo-metadata-remover-engine

@@ -89,7 +89,7 @@ This program is distributed in the hope that it will be useful, but **without an
 **Developer:** Amandeep Singh  
 **Email:** [support@striptools.dev](mailto:support@striptools.dev)  
 **Website:** [striptools.dev](https://striptools.dev)  
-**Full app:** [Strip on Google Play](https://play.google.com/store/apps/details?id=com.stripdev.strip)
+**Full app:** [Strip: Photo Metadata Remover on Google Play](https://play.google.com/store/apps/details?id=com.stripdev.strip)
 
 ---
 

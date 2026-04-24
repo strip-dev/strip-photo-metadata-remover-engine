@@ -19,6 +19,10 @@ The engine that powers **[Strip: Photo Metadata Remover](https://play.google.com
 - Runs entirely on‑device – **no network permission, no analytics, no data collection**
 
 ---
+## 📚 Documentation
+
+- [Engine Architecture](docs/ARCHITECTURE.md)
+- [How to Verify](docs/VERIFICATION.md)
 
 ## 📦 Usage
 

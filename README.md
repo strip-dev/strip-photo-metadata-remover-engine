@@ -80,7 +80,7 @@ No UI · no billing · no network · just the privacy‑sensitive core.
 
 ## 🔒 License
 
-Copyright (C) 2026 **Amandeep Singh**
+Copyright (C) 2026 **Strip Dev**
 
 This program is free software: you can redistribute it and/or modify it under the terms of the **GNU Affero General Public License** as published by the Free Software Foundation, either version 3 of the License, or any later version.
 
@@ -90,7 +90,7 @@ This program is distributed in the hope that it will be useful, but **without an
 
 ## 📬 Contact
 
-**Developer:** Amandeep Singh  
+**Developer:** Strip Dev
 **Email:** [support@striptools.dev](mailto:support@striptools.dev)  
 **Website:** [striptools.dev](https://striptools.dev)  
 **Full app:** [Strip Photo: Metadata Remover on Google Play](https://play.google.com/store/apps/details?id=com.stripdev.strip)

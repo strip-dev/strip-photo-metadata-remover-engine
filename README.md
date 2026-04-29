@@ -66,6 +66,9 @@ To verify that the Play Store version of Strip uses this exact code, you can:
 ## 📂 Repository Structure
 ```text engine/
 engine/
+├── docs
+    └── ARCHITECTURE.md          # Architecture documentation
+    └── VERIFICATION.md          # Document erification
 ├── src/main/java/com/stripdev/strip/
 │   └── PhotoCleaner.kt          # Full metadata removal engine
 ├── build.gradle.kts             # Engine module dependencies

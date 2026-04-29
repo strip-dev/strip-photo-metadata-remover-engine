@@ -1,9 +1,9 @@
-# Strip: Photo Metadata Removal Engine
+# Strip Photo: Metadata Removal Engine
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Android](https://img.shields.io/badge/Android-API_26+-green.svg)](https://developer.android.com)
 
-The engine that powers **[Strip: Photo Metadata Remover](https://play.google.com/store/apps/details?id=com.stripdev.strip)**.  
+The engine that powers **[Strip Photo: Metadata Remover](https://play.google.com/store/apps/details?id=com.stripdev.strip)**.  
 100 % offline · zero network calls · fully auditable.
 
 ---
@@ -89,7 +89,7 @@ This program is distributed in the hope that it will be useful, but **without an
 **Developer:** Amandeep Singh  
 **Email:** [support@striptools.dev](mailto:support@striptools.dev)  
 **Website:** [striptools.dev](https://striptools.dev)  
-**Full app:** [Strip: Photo Metadata Remover on Google Play](https://play.google.com/store/apps/details?id=com.stripdev.strip)
+**Full app:** [Strip Photo: Metadata Remover on Google Play](https://play.google.com/store/apps/details?id=com.stripdev.strip)
 
 ---
 

@@ -26,6 +26,7 @@ import java.io.File
 import java.io.IOException
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.collections.plusAssign
 import kotlin.math.abs
 import kotlin.math.sqrt
 
@@ -953,8 +954,10 @@ object PhotoCleaner {
             val contentValues = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
                 put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
-                put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/Strip")
-                put(MediaStore.MediaColumns.IS_PENDING, 1)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/Strip")
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
             }
 
             val resolver = context.contentResolver
@@ -963,9 +966,11 @@ object PhotoCleaner {
             uri?.let { targetUri ->
                 resolver.openOutputStream(targetUri)?.use { it.write(bytes) }
 
-                contentValues.clear()
-                contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                resolver.update(targetUri, contentValues, null, null)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    contentValues.clear()
+                    contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    resolver.update(targetUri, contentValues, null, null)
+                }
                 targetUri
             }
         } catch (e: Exception) {

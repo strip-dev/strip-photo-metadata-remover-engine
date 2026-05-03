@@ -1,6 +1,6 @@
 # Strip Photo: Metadata Removal Engine
 
-[![Strip Photo v0.7.6+b28](https://img.shields.io/badge/Strip_Photo-v0.7.6+b28-111315)](https://play.google.com/store/apps/details?id=com.stripdev.strip)
+[![Strip Photo v0.8.0+b29](https://img.shields.io/badge/Strip_Photo-v0.8.0+b29-111315)](https://play.google.com/store/apps/details?id=com.stripdev.strip)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Android](https://img.shields.io/badge/Android-API_26+-green.svg)](https://developer.android.com)
 

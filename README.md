@@ -90,7 +90,7 @@ This program is distributed in the hope that it will be useful, but **without an
 
 ## 📬 Contact
 
-**Developer:** Vantre
+**Developer:** Vantre 
 **Email:** [support@getvantre.com](mailto:support@getvantre.com)  
 **Website:** [getvantre.com](https://getvantre.com)  
 **Full app:** [Photo Metadata Remover: EXIF on Google Play](https://play.google.com/store/apps/details?id=com.stripdev.strip)

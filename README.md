@@ -1,10 +1,10 @@
-# Strip Photo: Metadata Removal Engine
+# Vantre Photo Metadata Remover Engine
 
-[![Strip Photo v0.8.0+b29](https://img.shields.io/badge/Strip_Photo-v0.8.0+b29-111315)](https://play.google.com/store/apps/details?id=com.stripdev.strip)
+[![Vantre Photo v0.8.0+b29](https://img.shields.io/badge/Vantre_Photo-v0.8.0+b29-111315)](https://play.google.com/store/apps/details?id=com.stripdev.strip)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Android](https://img.shields.io/badge/Android-API_26+-green.svg)](https://developer.android.com)
 
-The engine that powers **[Strip Photo: Metadata Remover](https://play.google.com/store/apps/details?id=com.stripdev.strip)**.  
+The engine that powers **[Photo Metadata Remover: EXIF](https://play.google.com/store/apps/details?id=com.stripdev.strip)**.  
 100 % offline · zero network calls · fully auditable.
 
 ---
@@ -12,7 +12,7 @@ The engine that powers **[Strip Photo: Metadata Remover](https://play.google.com
 ## 🔍 What It Does
 
 - **Reads** EXIF, XMP, and IPTC metadata from images on Android
-- **Strips** GPS coordinates, device details, timestamps, camera/lens data, software info, authorship notes, and embedded XMP/IPTC fields
+- **Removes** GPS coordinates, device details, timestamps, camera/lens data, software info, authorship notes, and embedded XMP/IPTC fields
 - **Supports selective preservation** – keep what you need, remove the rest
 - **Verifies** scrubbed output to guarantee clean files
 - **Audits** metadata and generates a risk score before and after scrubbing
@@ -56,11 +56,11 @@ println("Risk score: ${metadata.riskScore}")
 The engine is a standard Android library module. You can build it with Android Studio or any Gradle‑compatible environment.  
 The output is an AAR (Android Archive) ready to be included in any app.
 
-To verify that the Play Store version of Strip uses this exact code, you can:
+To verify that the Play Store version of Vantre Photo uses this exact code, you can:
 
 1. Build the library from source.
 2. Extract the compiled Java/Kotlin classes from the resulting AAR.
-3. Compare those classes against the engine classes found inside the Strip APK.
+3. Compare those classes against the engine classes found inside the Vantre Photo APK.
 4. For fully reproducible builds, use Gradle 8.x, AGP 8.x, Android API 36, and JDK 17.
 
 ## 📂 Repository Structure
@@ -80,7 +80,7 @@ No UI · no billing · no network · just the privacy‑sensitive core.
 
 ## 🔒 License
 
-Copyright (C) 2026 **Strip Dev**
+Copyright (C) 2026 **Vantre**
 
 This program is free software: you can redistribute it and/or modify it under the terms of the **GNU Affero General Public License** as published by the Free Software Foundation, either version 3 of the License, or any later version.
 
@@ -90,10 +90,10 @@ This program is distributed in the hope that it will be useful, but **without an
 
 ## 📬 Contact
 
-**Developer:** Strip Dev
-**Email:** [support@striptools.dev](mailto:support@striptools.dev)  
-**Website:** [striptools.dev](https://striptools.dev)  
-**Full app:** [Strip Photo: Metadata Remover on Google Play](https://play.google.com/store/apps/details?id=com.stripdev.strip)
+**Developer:** Vantre
+**Email:** [support@getvantre.com](mailto:support@getvantre.com)  
+**Website:** [getvantre.com](https://getvantre.com)  
+**Full app:** [Photo Metadata Remover: EXIF on Google Play](https://play.google.com/store/apps/details?id=com.stripdev.strip)
 
 ---
 

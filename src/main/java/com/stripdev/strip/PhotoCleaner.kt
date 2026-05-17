@@ -2,17 +2,22 @@ package com.stripdev.strip
 
 import android.app.ActivityManager
 import android.content.ContentResolver
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.util.Log
 import android.os.Build
+import android.os.Environment
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.exifinterface.media.ExifInterface
 import com.drew.imaging.ImageMetadataReader
 import com.drew.metadata.Directory
+import com.drew.metadata.exif.GpsDirectory
 import com.drew.metadata.iptc.IptcDirectory
 import com.drew.metadata.xmp.XmpDirectory
 import org.apache.commons.imaging.formats.jpeg.iptc.IptcRecord
@@ -24,16 +29,17 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.io.File
 import java.io.IOException
+import java.io.BufferedInputStream
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
+
 import kotlin.collections.plusAssign
 import kotlin.math.abs
 import kotlin.math.sqrt
 
 object PhotoCleaner {
 
-    private val metadataInfoCache = ConcurrentHashMap<String, MetadataInfo>()
-    private val detailedMetadataCache = ConcurrentHashMap<String, List<MetadataSection>>()
+    // No persistent metadata cache - always read fresh so re-auditing an image
+    // (e.g. after adding/removing geotags) returns up-to-date results.
 
     private data class EmbeddedMetadataPresence(
         val hasXmp: Boolean,
@@ -53,7 +59,21 @@ object PhotoCleaner {
         val iptcCaption: String? = null,
         val iptcKeywords: String? = null,
         val iptcCopyright: String? = null
-    )
+    ) {
+        val hasUserXmp: Boolean
+            get() = !xmpCreator.isNullOrBlank() ||
+                !xmpTitle.isNullOrBlank() ||
+                !xmpRights.isNullOrBlank()
+
+        val hasUserIptc: Boolean
+            get() = !iptcAuthor.isNullOrBlank() ||
+                !iptcCaption.isNullOrBlank() ||
+                !iptcKeywords.isNullOrBlank() ||
+                !iptcCopyright.isNullOrBlank()
+
+        val hasUserNonExifMetadata: Boolean
+            get() = hasUserXmp || hasUserIptc
+    }
 
     private data class EmbeddedMetadataPreservation(
         val xmpCreator: String? = null,
@@ -331,10 +351,10 @@ object PhotoCleaner {
 
         return if (baseName != null) {
             val indexSuffix = index?.let { "_${it + 1}" } ?: ""
-            "Strip_${baseName}${indexSuffix}.$extension"
+            "Vantre_${baseName}${indexSuffix}.$extension"
         } else {
             val indexSuffix = index?.let { "_${it + 1}" } ?: ""
-            "Strip_${System.currentTimeMillis()}${indexSuffix}.$extension"
+            "Vantre_${System.currentTimeMillis()}${indexSuffix}.$extension"
         }
     }
 
@@ -416,11 +436,22 @@ object PhotoCleaner {
         file: File,
         options: ScrubbingOptions
     ): Boolean {
-        return runCatching {
+        // Logs to the `VantreVerify` tag with a specific reason on failure, so users
+        // hitting VERIFICATION_FAILED can copy the actual offending check.
+        fun logFailure(gate: String, detail: String = ""): Boolean {
+            Log.w("VantreVerify", "verifyScrubbedFile FAILED at gate=$gate $detail uri=$sourceUri")
+            return false
+        }
+        try {
             val exif = ExifInterface(file.absolutePath)
 
-            if (!options.keepGps && extractLatLong(exif) != null) return false
-            if (!options.keepDeviceDetails && hasAnyTag(exif, ExifInterface.TAG_MAKE, ExifInterface.TAG_MODEL)) return false
+            if (!options.keepGps) {
+                val latLong = extractLatLong(exif)
+                if (latLong != null) return logFailure("gps", "latLong=[${latLong[0]},${latLong[1]}]")
+            }
+            if (!options.keepDeviceDetails && hasAnyTag(exif, ExifInterface.TAG_MAKE, ExifInterface.TAG_MODEL)) {
+                return logFailure("deviceDetails", "make=${exif.getAttribute(ExifInterface.TAG_MAKE)} model=${exif.getAttribute(ExifInterface.TAG_MODEL)}")
+            }
             if (!options.keepDateTime && hasAnyTag(
                     exif,
                     ExifInterface.TAG_DATETIME,
@@ -433,8 +464,10 @@ object PhotoCleaner {
                     ExifInterface.TAG_OFFSET_TIME_ORIGINAL,
                     ExifInterface.TAG_OFFSET_TIME_DIGITIZED
                 )
-            ) return false
-            if (!options.keepCameraLens && hasAnyTag(exif, ExifInterface.TAG_LENS_MAKE, ExifInterface.TAG_LENS_MODEL)) return false
+            ) return logFailure("dateTime", "datetime=${exif.getAttribute(ExifInterface.TAG_DATETIME)}")
+            if (!options.keepCameraLens && hasAnyTag(exif, ExifInterface.TAG_LENS_MAKE, ExifInterface.TAG_LENS_MODEL)) {
+                return logFailure("cameraLens")
+            }
             if (!options.keepExposureSettings && hasAnyTag(
                     exif,
                     ExifInterface.TAG_F_NUMBER,
@@ -444,8 +477,10 @@ object PhotoCleaner {
                     ExifInterface.TAG_FLASH,
                     ExifInterface.TAG_WHITE_BALANCE
                 )
-            ) return false
-            if (!options.keepSoftwareInfo && hasAnyTag(exif, ExifInterface.TAG_SOFTWARE)) return false
+            ) return logFailure("exposureSettings")
+            if (!options.keepSoftwareInfo && hasAnyTag(exif, ExifInterface.TAG_SOFTWARE)) {
+                return logFailure("softwareInfo", "software=${exif.getAttribute(ExifInterface.TAG_SOFTWARE)}")
+            }
             if (!options.keepAuthorshipNotes && hasAnyTag(
                     exif,
                     ExifInterface.TAG_USER_COMMENT,
@@ -453,15 +488,34 @@ object PhotoCleaner {
                     ExifInterface.TAG_COPYRIGHT,
                     ExifInterface.TAG_IMAGE_DESCRIPTION
                 )
-            ) return false
+            ) return logFailure(
+                "authorshipNotes",
+                "userComment=${exif.getAttribute(ExifInterface.TAG_USER_COMMENT)?.take(40)}" +
+                    " artist=${exif.getAttribute(ExifInterface.TAG_ARTIST)?.take(40)}" +
+                    " copyright=${exif.getAttribute(ExifInterface.TAG_COPYRIGHT)?.take(40)}" +
+                    " description=${exif.getAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION)?.take(40)}"
+            )
+
             val sourceEmbedded = readEmbeddedMetadataDetails(context, sourceUri)
             val cleanedEmbedded = readEmbeddedMetadataDetails(file)
 
-            if (!options.keepEmbeddedMetadata && cleanedEmbedded.presence.hasNonExifMetadata) return false
-            if (!verifyEmbeddedMetadata(sourceEmbedded, cleanedEmbedded, options)) return false
+            // Only fail when the cleaned file still carries user-identifying XMP/IPTC fields.
+            // A bare `hasXmp` is not sufficient - Ultra HDR re-encodes legitimately emit an
+            // `hdrgm:` XMP packet that contains no PII.
+            if (!options.keepEmbeddedMetadata && cleanedEmbedded.hasUserNonExifMetadata) {
+                return logFailure("residualXmpIptc",
+                    "xmpCreator=${cleanedEmbedded.xmpCreator} xmpTitle=${cleanedEmbedded.xmpTitle} iptcAuthor=${cleanedEmbedded.iptcAuthor} iptcCaption=${cleanedEmbedded.iptcCaption}")
+            }
+            if (!verifyEmbeddedMetadata(sourceEmbedded, cleanedEmbedded, options)) {
+                return logFailure("embeddedMetadataDelta")
+            }
 
-            true
-        }.getOrDefault(false)
+            return true
+        } catch (e: Exception) {
+            // Don't silently swallow - log so we know if e.g. ExifInterface threw or OOM hit.
+            Log.w("VantreVerify", "verifyScrubbedFile EXCEPTION on uri=$sourceUri", e)
+            return false
+        }
     }
 
     private fun verifyEmbeddedMetadata(
@@ -575,10 +629,31 @@ object PhotoCleaner {
                 ExifInterface.TAG_IMAGE_DESCRIPTION
             ))
 
-            // 2. Wipe everything in SENSITIVE_TAGS that isn't in tagsToKeep
+            // 2. Wipe everything in SENSITIVE_TAGS that isn't in tagsToKeep.
+            // AndroidX ExifInterface's setAttribute(tag, null) is documented to remove the
+            // attribute, but for charset-prefixed string tags (notably TAG_USER_COMMENT) and
+            // some structured tags, the underlying bytes can survive a null clear and
+            // re-appear on the next read. Belt-and-braces: write null AND an empty string
+            // for known sticky string tags.
+            val stickyStringTags = setOf(
+                ExifInterface.TAG_USER_COMMENT,
+                ExifInterface.TAG_ARTIST,
+                ExifInterface.TAG_COPYRIGHT,
+                ExifInterface.TAG_IMAGE_DESCRIPTION,
+                ExifInterface.TAG_SOFTWARE,
+                ExifInterface.TAG_MAKE,
+                ExifInterface.TAG_MODEL,
+                ExifInterface.TAG_LENS_MAKE,
+                ExifInterface.TAG_LENS_MODEL
+            )
             for (tag in SENSITIVE_TAGS) {
                 if (!tagsToKeep.contains(tag)) {
                     exif.setAttribute(tag, null)
+                    if (tag in stickyStringTags) {
+                        // Second pass: overwrite with empty string to neutralise any
+                        // residue that survived the null clear.
+                        exif.setAttribute(tag, "")
+                    }
                 }
             }
 
@@ -625,6 +700,13 @@ object PhotoCleaner {
             inputStream?.close()
 
             if (bitmap == null) return null
+
+            // Ultra HDR sources (Pixel 8+/S24+) decode with a gain map attached. Bitmap.compress
+            // would otherwise re-emit the gain map plus an `hdrgm:` XMP packet, which trips
+            // verifyScrubbedFile.
+            if (Build.VERSION.SDK_INT >= 34 && bitmap.hasGainmap()) {
+                bitmap.gainmap = null
+            }
 
             val tempExtension = extensionForBitmapFormat(outputFormat)
             val cleanFile = File(context.cacheDir, "temp_strip_${System.currentTimeMillis()}.$tempExtension")
@@ -955,7 +1037,7 @@ object PhotoCleaner {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
                 put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/Strip")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/Vantre")
                     put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
             }
@@ -992,8 +1074,6 @@ object PhotoCleaner {
     }
 
     fun getMetadataDetails(context: Context, uri: Uri): MetadataInfo {
-        val cacheKey = uri.toString()
-        metadataInfoCache[cacheKey]?.let { return it }
 
         val metadata = try {
             val contentResolver = context.contentResolver
@@ -1006,8 +1086,20 @@ object PhotoCleaner {
                 }
             }
 
-            val exifSources = loadExifInterfaces(contentResolver, uri)
+            // (Previously had a Log.d("VantreFUSE", "diagnose($uri): …") here that
+            // ran on every audit and logged the photo URI to logcat. Removed for
+            // release — URIs are PII (especially MediaStore IDs that can be
+            // re-resolved to filesystem paths) and we don't need this diagnostic
+            // in production. Re-add locally during debugging if a GPS-recovery
+            // regression surfaces on Android 11+ FUSE redaction.)
+            val exifSources = loadExifInterfaces(context, uri)
             val embeddedMetadata = readEmbeddedMetadataDetails(context, uri)
+
+            // ALWAYS try to extract GPS, even if ExifInterface completely fails to load the file.
+            val latLong = exifSources.firstNotNullOfOrNull { extractLatLong(it) }
+                ?: extractLatLongViaMetadataExtractor(context, uri)
+                ?: extractLatLongViaCacheFile(context, uri)
+
             exifSources.firstOrNull()?.let { primaryExif ->
                 val model = firstExifAttribute(exifSources, ExifInterface.TAG_MODEL)
                 val make = firstExifAttribute(exifSources, ExifInterface.TAG_MAKE)
@@ -1017,7 +1109,6 @@ object PhotoCleaner {
                     ExifInterface.TAG_DATETIME_ORIGINAL,
                     ExifInterface.TAG_DATETIME_DIGITIZED
                 )
-                val latLong = exifSources.firstNotNullOfOrNull { extractLatLong(it) }
                 val software = firstExifAttribute(exifSources, ExifInterface.TAG_SOFTWARE)
                 val fNumber = firstExifAttribute(exifSources, ExifInterface.TAG_F_NUMBER)
                 val iso = firstExifAttribute(exifSources, ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)
@@ -1030,8 +1121,8 @@ object PhotoCleaner {
                 if (model != null || make != null) score += 20
                 if (dateTime != null) score += 10
                 if (software != null) score += 10
-                if (embeddedMetadata.presence.hasXmp) score += 10
-                if (embeddedMetadata.presence.hasIptc) score += 10
+                if (embeddedMetadata.hasUserXmp) score += 10
+                if (embeddedMetadata.hasUserIptc) score += 10
                 score = score.coerceAtMost(100)
 
                 MetadataInfo(
@@ -1052,11 +1143,12 @@ object PhotoCleaner {
                     iptcCaption = embeddedMetadata.iptcCaption ?: "None Detected",
                     iptcKeywords = embeddedMetadata.iptcKeywords ?: "None Detected",
                     iptcCopyright = embeddedMetadata.iptcCopyright ?: "None Detected",
-                    hasSensitiveData = latLong != null || model != null || dateTime != null || embeddedMetadata.presence.hasNonExifMetadata,
+                    hasSensitiveData = latLong != null || model != null || dateTime != null || embeddedMetadata.hasUserNonExifMetadata,
                     riskScore = score
                 )
             } ?: MetadataInfo(
                 fileSize = sizeStr,
+                gps = latLong?.let { formatLatLong(it[0], it[1]) } ?: "None Detected",
                 hasXmp = embeddedMetadata.presence.hasXmp,
                 hasIptc = embeddedMetadata.presence.hasIptc,
                 xmpCreator = embeddedMetadata.xmpCreator ?: "None Detected",
@@ -1066,25 +1158,23 @@ object PhotoCleaner {
                 iptcCaption = embeddedMetadata.iptcCaption ?: "None Detected",
                 iptcKeywords = embeddedMetadata.iptcKeywords ?: "None Detected",
                 iptcCopyright = embeddedMetadata.iptcCopyright ?: "None Detected",
-                hasSensitiveData = embeddedMetadata.presence.hasNonExifMetadata,
+                hasSensitiveData = latLong != null || embeddedMetadata.hasUserNonExifMetadata,
                 riskScore = buildList {
-                    if (embeddedMetadata.presence.hasXmp) add(10)
-                    if (embeddedMetadata.presence.hasIptc) add(10)
+                    if (latLong != null) add(60)
+                    if (embeddedMetadata.hasUserXmp) add(10)
+                    if (embeddedMetadata.hasUserIptc) add(10)
                 }.sum().coerceAtMost(100)
             )
         } catch (e: Exception) {
             MetadataInfo()
         }
-        metadataInfoCache[cacheKey] = metadata
         return metadata
     }
 
     fun getDetailedMetadata(context: Context, uri: Uri): List<MetadataSection> {
-        val cacheKey = uri.toString()
-        detailedMetadataCache[cacheKey]?.let { return it }
 
         val sections = try {
-            val exifSources = loadExifInterfaces(context.contentResolver, uri)
+            val exifSources = loadExifInterfaces(context, uri)
             val sections = DEEP_METADATA_TAGS.mapNotNull { (title, tags) ->
                 val fields = tags.mapNotNull { tag ->
                     firstExifAttribute(exifSources, tag)?.let { value ->
@@ -1093,6 +1183,13 @@ object PhotoCleaner {
                 }
                 if (fields.isEmpty()) null else MetadataSection(title = title, fields = fields)
             }.toMutableList()
+
+            // If ExifInterface completely failed to parse the Location tags (which often happens
+            // on scrubbed files where the EXIF IFD is stripped but the GPS IFD remains),
+            // use ImageMetadataReader as a robust fallback to show the raw GPS tags.
+            if (sections.none { it.title == "Location" }) {
+                recoverRawGpsSection(context, uri)?.let { sections.add(it) }
+            }
 
             val summary = getMetadataDetails(context, uri)
             val summaryFields = listOfNotNull(
@@ -1120,7 +1217,6 @@ object PhotoCleaner {
         } catch (_: Exception) {
             emptyList()
         }
-        detailedMetadataCache[cacheKey] = sections
         return sections
     }
 
@@ -1131,33 +1227,147 @@ object PhotoCleaner {
     }
 
     fun invalidateMetadata(uri: Uri?) {
-        if (uri == null) return
-        val cacheKey = uri.toString()
-        metadataInfoCache.remove(cacheKey)
-        detailedMetadataCache.remove(cacheKey)
+        // No-op: caching was removed so metadata is always read fresh.
+        // Kept for API compatibility.
     }
 
     private fun loadExifInterfaces(
-        contentResolver: ContentResolver,
+        context: Context,
         uri: Uri
     ): List<ExifInterface> {
+        val contentResolver = context.contentResolver
         val exifSources = mutableListOf<ExifInterface>()
 
+        // For MediaStore URIs on API 29+, ask the content provider for the un-redacted
+        // version explicitly. Requires the ACCESS_MEDIA_LOCATION runtime permission to
+        // actually return GPS data; if not granted, returns the same redacted bytes.
+        val unredactedUri: Uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            uri.authority == MediaStore.AUTHORITY) {
+            runCatching { MediaStore.setRequireOriginal(uri) }.getOrDefault(uri)
+        } else {
+            uri
+        }
+
+        // Primary approach: resolve the real file path and read EXIF directly.
+        // Android's content providers redact GPS data from streams/FDs on API 29+.
+        // Reading from the actual file path bypasses this redaction layer.
+        // Just try and let it fail naturally - file.exists()/canRead() gates were
+        // blocking valid path reads in zero-permissions builds.
+        runCatching {
+            resolveFilePath(context, uri)?.let { path ->
+                exifSources += ExifInterface(path)
+            }
+        }
+
+        // Secondary: file descriptor (seekable). Use the un-redacted URI when available.
         try {
-            contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+            contentResolver.openFileDescriptor(unredactedUri, "r")?.use { descriptor ->
                 exifSources += ExifInterface(descriptor.fileDescriptor)
             }
         } catch (_: Exception) {
         }
 
+        // Tertiary: direct InputStream on the un-redacted URI when possible.
         try {
-            contentResolver.openInputStream(uri)?.use { stream ->
+            contentResolver.openInputStream(unredactedUri)?.use { stream ->
                 exifSources += ExifInterface(stream)
             }
         } catch (_: Exception) {
         }
 
         return exifSources
+    }
+
+    /**
+     * Resolves the actual file system path from a content URI.
+     * This bypasses Android's GPS redaction layer which strips location metadata
+     * from streams and file descriptors obtained through content providers.
+     *
+     * Handles:
+     * - MediaDocumentsProvider  (content://com.android.providers.media.documents/...)
+     * - ExternalStorageProvider (content://com.android.externalstorage.documents/...)
+     * - MediaStore URIs         (content://media/external/images/media/123)
+     * - file:// URIs
+     */
+    private fun resolveFilePath(context: Context, uri: Uri): String? {
+        // Direct file URI
+        if (uri.scheme == ContentResolver.SCHEME_FILE) {
+            return uri.path
+        }
+
+        val contentResolver = context.contentResolver
+
+        // Content URIs from document providers
+        if (DocumentsContract.isDocumentUri(context, uri)) {
+            val authority = uri.authority
+            val docId = DocumentsContract.getDocumentId(uri)
+
+            // MediaDocumentsProvider: docId = "image:123"
+            if (authority == "com.android.providers.media.documents") {
+                val parts = docId.split(":")
+                if (parts.size == 2) {
+                    val mediaId = parts[1].toLongOrNull()
+                    if (mediaId != null) {
+                        val mediaUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                        return queryMediaStorePath(
+                            contentResolver,
+                            ContentUris.withAppendedId(mediaUri, mediaId)
+                        )
+                    }
+                }
+            }
+
+            // ExternalStorageProvider: docId = "primary:DCIM/Camera/photo.jpg"
+            if (authority == "com.android.externalstorage.documents") {
+                val parts = docId.split(":")
+                if (parts.size == 2) {
+                    val volumePath = if (parts[0] == "primary") {
+                        @Suppress("DEPRECATION")
+                        Environment.getExternalStorageDirectory().absolutePath
+                    } else {
+                        "/storage/${parts[0]}"
+                    }
+                    return "$volumePath/${parts[1]}"
+                }
+            }
+
+            // DownloadsProvider: docId may be a raw path or a numeric ID
+            if (authority == "com.android.providers.downloads.documents") {
+                if (docId.startsWith("raw:")) {
+                    return docId.removePrefix("raw:")
+                }
+                val id = docId.toLongOrNull()
+                if (id != null) {
+                    val downloadUri = ContentUris.withAppendedId(
+                        Uri.parse("content://downloads/public_downloads"), id
+                    )
+                    return queryMediaStorePath(contentResolver, downloadUri)
+                }
+            }
+        }
+
+        // Direct MediaStore URI (content://media/...)
+        if (uri.authority == MediaStore.AUTHORITY) {
+            return queryMediaStorePath(contentResolver, uri)
+        }
+
+        return null
+    }
+
+    @Suppress("DEPRECATION")
+    private fun queryMediaStorePath(contentResolver: ContentResolver, uri: Uri): String? {
+        return runCatching {
+            contentResolver.query(
+                uri,
+                arrayOf(MediaStore.MediaColumns.DATA),
+                null, null, null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
+                    if (idx >= 0) cursor.getString(idx) else null
+                } else null
+            }
+        }.getOrNull()
     }
 
     private fun firstExifAttribute(
@@ -1172,6 +1382,156 @@ object PhotoCleaner {
             }
         }
         return null
+    }
+
+    /**
+     * Inspects the raw bytes the OS hands us via the content resolver to determine whether
+     * the EXIF GPS IFD marker (0x8825) is present. On Android 11+ the FUSE filesystem layer
+     * strips GPS bytes at the kernel level for apps without `ACCESS_MEDIA_LOCATION`, which
+     * means every downstream parser (ExifInterface, metadata-extractor, raw byte scan) sees
+     * a stream that no longer contains location data. If this function reports
+     * "GPS IFD marker NOT FOUND", no code-side fix in PhotoCleaner can recover GPS.
+     *
+     * Output is logged to LogCat under the tag `VantreFUSE` so it can be tailed during testing.
+     */
+    private fun diagnoseBytesForGps(context: Context, uri: Uri): String {
+        return try {
+            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: return "stream null"
+            val gpsMarker = byteArrayOf(0x88.toByte(), 0x25.toByte())
+            val idx = (0 until bytes.size - 1).firstOrNull { i ->
+                bytes[i] == gpsMarker[0] && bytes[i + 1] == gpsMarker[1]
+            }
+            if (idx == null) {
+                "GPS IFD marker NOT FOUND in ${bytes.size} bytes - FUSE stripped it"
+            } else {
+                "GPS IFD marker found at offset $idx (of ${bytes.size}) - bytes intact"
+            }
+        } catch (e: Exception) {
+            "diagnostic error: ${e.message}"
+        }
+    }
+
+    private fun extractLatLongViaMetadataExtractor(context: Context, uri: Uri): DoubleArray? {
+        return runCatching {
+            // First attempt: unredacted file path
+            resolveFilePath(context, uri)?.let { path ->
+                runCatching {
+                    val metadata = ImageMetadataReader.readMetadata(File(path))
+                    metadata.getFirstDirectoryOfType(GpsDirectory::class.java)?.let { dir ->
+                        val geo = dir.geoLocation
+                        if (geo != null && isMeaningfulLatLong(geo.latitude, geo.longitude)) {
+                            return@runCatching doubleArrayOf(geo.latitude, geo.longitude)
+                        }
+                    }
+                }.getOrNull()
+            }
+            
+            // Try direct stream first (may be redacted by Android)
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                val buffered = if (stream.markSupported()) stream else BufferedInputStream(stream)
+                val metadata = ImageMetadataReader.readMetadata(buffered)
+                metadata.getFirstDirectoryOfType(GpsDirectory::class.java)
+                    ?.geoLocation
+                    ?.takeIf { isMeaningfulLatLong(it.latitude, it.longitude) }
+                    ?.let { doubleArrayOf(it.latitude, it.longitude) }
+            } ?: run {
+                // Fallback to temp file. `deleteOnExit()` is unreliable on Android
+                // (the JVM rarely exits cleanly), so explicitly delete in finally —
+                // otherwise this leaks one `gps*.tmp` per audited photo and balloons
+                // the app cache after a heavy session.
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    val tempFile = File.createTempFile("gps", ".tmp", context.cacheDir)
+                    try {
+                        tempFile.outputStream().use { stream.copyTo(it) }
+                        val metadata = ImageMetadataReader.readMetadata(tempFile)
+                        metadata.getFirstDirectoryOfType(GpsDirectory::class.java)
+                            ?.geoLocation
+                            ?.takeIf { isMeaningfulLatLong(it.latitude, it.longitude) }
+                            ?.let { doubleArrayOf(it.latitude, it.longitude) }
+                    } finally {
+                        tempFile.delete()
+                    }
+                }
+            }
+        }.getOrNull()
+    }
+
+    private fun recoverRawGpsSection(context: Context, uri: Uri): MetadataSection? {
+        return runCatching {
+            var gpsDir: GpsDirectory? = null
+
+            // First attempt: unredacted file path
+            resolveFilePath(context, uri)?.let { path ->
+                val file = File(path)
+                // We let ImageMetadataReader attempt reading directly even without explicit exists() checks
+                gpsDir = runCatching { ImageMetadataReader.readMetadata(file).getFirstDirectoryOfType(GpsDirectory::class.java) }.getOrNull()
+            }
+
+            // Fallback to stream if path failed
+            if (gpsDir == null) {
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    val buffered = if (stream.markSupported()) stream else BufferedInputStream(stream)
+                    gpsDir = runCatching { ImageMetadataReader.readMetadata(buffered).getFirstDirectoryOfType(GpsDirectory::class.java) }.getOrNull()
+                }
+            }
+            
+            // Final fallback: cache file
+            if (gpsDir == null) {
+                val tempFile = File.createTempFile("gps_raw", ".tmp", context.cacheDir).apply { deleteOnExit() }
+                try {
+                    context.contentResolver.openInputStream(uri)?.use { stream ->
+                        tempFile.outputStream().use { stream.copyTo(it) }
+                    }
+                    gpsDir = ImageMetadataReader.readMetadata(tempFile).getFirstDirectoryOfType(GpsDirectory::class.java)
+                } finally {
+                    tempFile.delete()
+                }
+            }
+
+            gpsDir?.let { dir ->
+                val fields = mutableListOf<MetadataField>()
+                val geo = dir.geoLocation
+                if (geo != null) {
+                    fields.add(MetadataField("GPS Latitude", geo.latitude.toString()))
+                    fields.add(MetadataField("GPS Longitude", geo.longitude.toString()))
+                }
+                
+                // Add any other raw GPS tags metadata-extractor found
+                for (tag in dir.tags) {
+                    if (!tag.tagName.contains("Latitude") && !tag.tagName.contains("Longitude")) {
+                        fields.add(MetadataField(tag.tagName, tag.description ?: ""))
+                    }
+                }
+                
+                if (fields.isNotEmpty()) {
+                    MetadataSection("Location (Recovered)", fields)
+                } else null
+            }
+        }.getOrNull()
+    }
+
+    private fun extractLatLongViaCacheFile(context: Context, uri: Uri): DoubleArray? {
+        val tempFile = File(context.cacheDir, "gps_read_${System.currentTimeMillis()}.jpg")
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                tempFile.outputStream().use { input.copyTo(it) }
+            }
+            // File path read = full EXIF seeking = no missed GPS IFDs
+            extractLatLong(ExifInterface(tempFile.absolutePath))
+                ?: run {
+                    // Belt-and-suspenders: also try metadata-extractor on the cached file
+                    val metadata = ImageMetadataReader.readMetadata(tempFile)
+                    metadata.getFirstDirectoryOfType(GpsDirectory::class.java)
+                        ?.geoLocation
+                        ?.takeIf { isMeaningfulLatLong(it.latitude, it.longitude) }
+                        ?.let { doubleArrayOf(it.latitude, it.longitude) }
+                }
+        } catch (_: Exception) {
+            null
+        } finally {
+            tempFile.delete()
+        }
     }
 
     private fun extractLatLong(exif: ExifInterface): DoubleArray? {
@@ -1201,6 +1561,7 @@ object PhotoCleaner {
         val epsilon = 0.000001
         return !(abs(latitude) < epsilon && abs(longitude) < epsilon)
     }
+
 
     private fun parseExifCoordinate(
         coordinate: String?,

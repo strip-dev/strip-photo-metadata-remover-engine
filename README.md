@@ -1,6 +1,6 @@
 # Vantre Photo Metadata Remover Engine
 
-[![Vantre Photo v0.9.26+b65](https://img.shields.io/badge/Vantre_Photo-v0.9.6+b65-111315)](https://play.google.com/store/apps/details?id=com.stripdev.strip)
+[![Vantre Photo v0.9.27+b66](https://img.shields.io/badge/Vantre_Photo-v0.9.7+b66-111315)](https://play.google.com/store/apps/details?id=com.stripdev.strip)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Android](https://img.shields.io/badge/Android-API_26+-green.svg)](https://developer.android.com)
 

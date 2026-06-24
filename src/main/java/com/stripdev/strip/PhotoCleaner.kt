@@ -10,11 +10,13 @@ import android.os.Build
 import android.os.Environment
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.exifinterface.media.ExifInterface
+import androidx.heifwriter.HeifWriter
 import com.drew.imaging.ImageMetadataReader
 import com.drew.metadata.Directory
 import com.drew.metadata.exif.GpsDirectory
@@ -25,6 +27,7 @@ import org.apache.commons.imaging.formats.jpeg.iptc.IptcTypes
 import org.apache.commons.imaging.formats.jpeg.iptc.JpegIptcRewriter
 import org.apache.commons.imaging.formats.jpeg.iptc.PhotoshopApp13Data
 import org.apache.commons.imaging.formats.jpeg.xmp.JpegXmpRewriter
+import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.io.File
@@ -37,6 +40,9 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 
 object PhotoCleaner {
+
+    /** Max time to wait for the HEVC encoder to finish a single-image HEIC re-encode. */
+    private const val HEIC_ENCODE_TIMEOUT_MS = 15_000L
 
     // No persistent metadata cache - always read fresh so re-auditing an image
     // (e.g. after adding/removing geotags) returns up-to-date results.
@@ -159,7 +165,14 @@ object PhotoCleaner {
         val iptcKeywords: String = "None Detected",
         val iptcCopyright: String = "None Detected",
         val hasSensitiveData: Boolean = false,
-        val riskScore: Int = 0 // 0 to 100
+        val riskScore: Int = 0, // 0 to 100
+        /**
+         * True when the file could not be decoded as a valid image (corrupt, truncated, or not
+         * actually an image). Distinct from a clean photo that simply carries no metadata: an
+         * unreadable file yields no trustworthy exposure signal, so the audit excludes it from the
+         * sampled estimate rather than miscounting it as "clean". See [getMetadataDetails].
+         */
+        val unreadable: Boolean = false
     )
 
     data class MetadataField(
@@ -673,6 +686,229 @@ object PhotoCleaner {
         }
     }
 
+    /**
+     * Full-resolution, format-preserving, orientation-preserving in-place clean path used by
+     * the Library Monitor bulk-clean flow. Unlike [scrubImage]'s bitmap fallback this NEVER
+     * downscales and NEVER silently drops orientation, because the output is written back over
+     * the user's original file rather than saved as a separate share copy.
+     *
+     * Returns a [ScrubResult] whose [ScrubResult.file] is a cleaned temp file at full resolution.
+     * The caller writes those bytes back to the original Uri (see [saveToUri]) and deletes the temp.
+     *
+     * Per-format strategy:
+     *  - JPEG (incl. XMP/IPTC): truly lossless. EXIF blacklist strip (orientation preserved) +
+     *    commons-imaging XMP/IPTC segment removal. No pixel decode.
+     *  - HEIC/HEIF: near-lossless full-res re-encode via [HeifWriter] at max quality, orientation
+     *    baked into pixels. Falls back to a high-quality JPEG when the device cannot HEIC-encode.
+     *    NOTE: keep-flags for embedded metadata cannot be honoured on the HEIC re-encode path.
+     *  - WebP/PNG: full-res recompress in the same (lossless) format, orientation baked in.
+     */
+    fun scrubInPlaceFullRes(
+        context: Context,
+        uri: Uri,
+        options: ScrubbingOptions = ScrubbingOptions()
+    ): ScrubResult {
+        val mimeType = context.contentResolver.getType(uri)?.lowercase(Locale.US)
+        if (mimeType?.startsWith("image/") != true) {
+            return ScrubResult(failureReason = ScrubFailureReason.UNSUPPORTED_FORMAT)
+        }
+
+        val fileSizeBytes = getFileSizeBytes(context, uri)
+        if (fileSizeBytes != null && fileSizeBytes > 50L * 1024L * 1024L) {
+            return ScrubResult(failureReason = ScrubFailureReason.FILE_TOO_LARGE)
+        }
+
+        val isJpeg = mimeType == "image/jpeg" || mimeType == "image/jpg"
+        val isHeic = mimeType == "image/heic" || mimeType == "image/heif"
+
+        val cleaned: File? = try {
+            when {
+                isJpeg -> stripJpegLosslessFullRes(context, uri, options)
+                isHeic -> stripHeicFullRes(context, uri, options)
+                else -> stripBitmapFullRes(context, uri, mimeType, options)
+            }
+        } catch (e: OutOfMemoryError) {
+            Log.w("VantreClean", "scrubInPlaceFullRes OOM on uri=$uri", e)
+            null
+        } catch (e: Exception) {
+            Log.w("VantreClean", "scrubInPlaceFullRes failed on uri=$uri", e)
+            null
+        }
+
+        if (cleaned == null) return ScrubResult(failureReason = ScrubFailureReason.PROCESSING_ERROR)
+
+        return if (verifyScrubbedFile(context, uri, cleaned, options)) {
+            ScrubResult(file = cleaned)
+        } else {
+            cleaned.delete()
+            ScrubResult(failureReason = ScrubFailureReason.VERIFICATION_FAILED)
+        }
+    }
+
+    /** Lossless JPEG clean: EXIF blacklist strip (orientation kept) + XMP/IPTC segment removal. */
+    private fun stripJpegLosslessFullRes(
+        context: Context,
+        uri: Uri,
+        options: ScrubbingOptions
+    ): File? {
+        // EXIF blacklist strip into a temp file. SENSITIVE_TAGS excludes TAG_ORIENTATION, so
+        // orientation survives untouched and no pixels are decoded.
+        val exifStripped = stripMetadataLossless(context, uri, options) ?: return null
+
+        val intermediates = mutableListOf<File>()
+        var current = exifStripped
+
+        // Remove the XMP packet losslessly (image data untouched). Safe no-op if none present.
+        runCatching {
+            val out = File(context.cacheDir, "lib_noxmp_${System.currentTimeMillis()}.jpg")
+            out.outputStream().use { JpegXmpRewriter().removeXmpXml(current, it) }
+            intermediates.add(current)
+            current = out
+        }
+        // Remove the IPTC / Photoshop APP13 segment losslessly.
+        runCatching {
+            val out = File(context.cacheDir, "lib_noiptc_${System.currentTimeMillis()}.jpg")
+            out.outputStream().use { JpegIptcRewriter().removeIptc(current, it) }
+            intermediates.add(current)
+            current = out
+        }
+
+        // If the user opted to keep specific XMP/IPTC fields, re-apply only those.
+        val result = if (options.keepEmbeddedMetadata) {
+            reApplyEmbeddedMetadata(context, uri, current, options)?.also {
+                if (it != current) intermediates.add(current)
+            } ?: current
+        } else {
+            current
+        }
+
+        intermediates.filter { it != result }.forEach { runCatching { it.delete() } }
+        return result
+    }
+
+    /** HEIC/HEIF clean: full-res re-encode via HeifWriter at max quality, orientation baked in. */
+    private fun stripHeicFullRes(
+        context: Context,
+        uri: Uri,
+        options: ScrubbingOptions
+    ): File? {
+        // HeifWriter requires API 28. On older devices clean to a high-quality JPEG instead.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            return stripBitmapToJpegFullRes(context, uri)
+        }
+        val bitmap = decodeUprightBitmap(context, uri) ?: return null
+        return try {
+            val out = File(context.cacheDir, "lib_heic_${System.currentTimeMillis()}.heic")
+            val writer = HeifWriter.Builder(
+                out.absolutePath,
+                bitmap.width,
+                bitmap.height,
+                HeifWriter.INPUT_MODE_BITMAP
+            ).setQuality(100).setMaxImages(1).build()
+            writer.start()
+            writer.addBitmap(bitmap)
+            writer.stop(HEIC_ENCODE_TIMEOUT_MS)
+            writer.close()
+            bitmap.recycle()
+            out
+        } catch (e: Exception) {
+            Log.w("VantreClean", "HEIC encode failed; falling back to JPEG uri=$uri", e)
+            bitmap.recycle()
+            stripBitmapToJpegFullRes(context, uri)
+        }
+    }
+
+    /** Full-res recompress for WebP/PNG (and any other decodable raster) in the same format. */
+    private fun stripBitmapFullRes(
+        context: Context,
+        uri: Uri,
+        mimeType: String,
+        options: ScrubbingOptions
+    ): File? {
+        val bitmap = decodeUprightBitmap(context, uri) ?: return null
+        val (format, ext) = when {
+            mimeType == "image/png" -> Bitmap.CompressFormat.PNG to "png"
+            mimeType == "image/webp" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R ->
+                (bitmapCompressFormatOrNull("WEBP_LOSSLESS") ?: Bitmap.CompressFormat.WEBP) to "webp"
+            mimeType == "image/webp" -> Bitmap.CompressFormat.WEBP to "webp"
+            else -> Bitmap.CompressFormat.JPEG to "jpg"
+        }
+        return compressBitmapToTemp(context, bitmap, format, ext)
+    }
+
+    /** Decode at full resolution, then re-encode as a near-lossless JPEG (HEIC/encode fallback). */
+    private fun stripBitmapToJpegFullRes(context: Context, uri: Uri): File? {
+        val bitmap = decodeUprightBitmap(context, uri) ?: return null
+        return compressBitmapToTemp(context, bitmap, Bitmap.CompressFormat.JPEG, "jpg")
+    }
+
+    private fun compressBitmapToTemp(
+        context: Context,
+        bitmap: Bitmap,
+        format: Bitmap.CompressFormat,
+        extension: String
+    ): File? {
+        return try {
+            // Ultra HDR sources decode with a gain map that would re-emit an hdrgm: XMP packet.
+            if (Build.VERSION.SDK_INT >= 34 && bitmap.hasGainmap()) bitmap.gainmap = null
+            val out = File(context.cacheDir, "lib_bmp_${System.currentTimeMillis()}.$extension")
+            out.outputStream().use { bitmap.compress(format, 100, it) }
+            bitmap.recycle()
+            out
+        } catch (e: Exception) {
+            bitmap.recycle()
+            null
+        }
+    }
+
+    /** Full-resolution decode with EXIF orientation baked into the pixels (no downscaling). */
+    private fun decodeUprightBitmap(context: Context, uri: Uri): Bitmap? {
+        val resolver = context.contentResolver
+        // Measure bounds first so we can cap the decode to the device's memory budget — the same
+        // guard the single-photo flow uses. Without it, full-res decode of large PNG/WebP/TIFF/HEIC
+        // images OOMs on low-memory devices (the photo is then skipped, never cleaned) and the
+        // oversized allocations thrash GC across large library cleans, slowing the whole batch.
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        val maxDimension = calculateAdaptiveMaxDimension(context)
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = calculateInSampleSize(bounds.outWidth, bounds.outHeight, maxDimension, maxDimension)
+        }
+        val raw = resolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, decodeOptions)
+        } ?: return null
+        val orientation = runCatching {
+            context.contentResolver.openInputStream(uri)?.use {
+                ExifInterface(it).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            }
+        }.getOrNull() ?: ExifInterface.ORIENTATION_NORMAL
+        return applyOrientation(raw, orientation)
+    }
+
+    private fun applyOrientation(bitmap: Bitmap, orientation: Int): Bitmap {
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> { matrix.postRotate(90f); matrix.postScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_TRANSVERSE -> { matrix.postRotate(270f); matrix.postScale(-1f, 1f) }
+            else -> return bitmap
+        }
+        return try {
+            val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+            if (rotated != bitmap) bitmap.recycle()
+            rotated
+        } catch (e: OutOfMemoryError) {
+            bitmap
+        }
+    }
+
     private fun stripMetadataWithBitmap(
         context: Context,
         uri: Uri,
@@ -928,6 +1164,24 @@ object PhotoCleaner {
         return inSampleSize
     }
 
+    /**
+     * Cheap check: can [uri] be decoded as a valid image? Uses a bounds-only decode (no pixel
+     * allocation) — a corrupt, truncated, or non-image file yields non-positive dimensions. Used by
+     * the audit to separate genuinely unreadable files from clean photos that merely lack metadata.
+     */
+    private fun isDecodableImage(context: Context, uri: Uri): Boolean = runCatching {
+        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+        opts.outWidth > 0 && opts.outHeight > 0
+    }.getOrDefault(false)
+
+    /**
+     * Public, cheap decodability probe: true when [uri] is a valid, decodable image. Lets callers
+     * (e.g. the Storage Audit bulk clean) skip corrupt/unreadable files *before* requesting write
+     * consent, so the system consent dialog count reflects only files that can actually be cleaned.
+     */
+    fun isReadableImage(context: Context, uri: Uri): Boolean = isDecodableImage(context, uri)
+
     private fun calculateAdaptiveMaxDimension(context: Context): Int {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
         val memoryClassMb = activityManager?.memoryClass ?: 128
@@ -1092,6 +1346,11 @@ object PhotoCleaner {
             // re-resolved to filesystem paths) and we don't need this diagnostic
             // in production. Re-add locally during debugging if a GPS-recovery
             // regression surfaces on Android 11+ FUSE redaction.)
+            // Can the file actually be decoded as an image? A corrupt/truncated file (or a non-image
+            // with an image MIME) reads zero metadata and would otherwise look identical to a clean
+            // photo. Flag it so the audit counts it separately instead of as "clean".
+            val unreadable = !isDecodableImage(context, uri)
+
             val exifSources = loadExifInterfaces(context, uri)
             val embeddedMetadata = readEmbeddedMetadataDetails(context, uri)
 
@@ -1144,7 +1403,8 @@ object PhotoCleaner {
                     iptcKeywords = embeddedMetadata.iptcKeywords ?: "None Detected",
                     iptcCopyright = embeddedMetadata.iptcCopyright ?: "None Detected",
                     hasSensitiveData = latLong != null || model != null || dateTime != null || embeddedMetadata.hasUserNonExifMetadata,
-                    riskScore = score
+                    riskScore = score,
+                    unreadable = unreadable
                 )
             } ?: MetadataInfo(
                 fileSize = sizeStr,
@@ -1163,10 +1423,12 @@ object PhotoCleaner {
                     if (latLong != null) add(60)
                     if (embeddedMetadata.hasUserXmp) add(10)
                     if (embeddedMetadata.hasUserIptc) add(10)
-                }.sum().coerceAtMost(100)
+                }.sum().coerceAtMost(100),
+                unreadable = unreadable
             )
         } catch (e: Exception) {
-            MetadataInfo()
+            // Reading threw outright — the file is unusable; treat it as unreadable, not clean.
+            MetadataInfo(unreadable = true)
         }
         return metadata
     }

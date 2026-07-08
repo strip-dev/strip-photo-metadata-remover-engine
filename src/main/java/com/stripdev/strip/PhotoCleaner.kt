@@ -602,7 +602,6 @@ object PhotoCleaner {
 
             val exif = ExifInterface(tempFile.absolutePath)
 
-            // 1. Determine tags to KEEP based on options
             val tagsToKeep = mutableSetOf<String>()
             if (options.keepDeviceDetails) tagsToKeep.addAll(listOf(ExifInterface.TAG_MAKE, ExifInterface.TAG_MODEL))
             if (options.keepDateTime) tagsToKeep.addAll(listOf(
@@ -642,12 +641,6 @@ object PhotoCleaner {
                 ExifInterface.TAG_IMAGE_DESCRIPTION
             ))
 
-            // 2. Wipe everything in SENSITIVE_TAGS that isn't in tagsToKeep.
-            // AndroidX ExifInterface's setAttribute(tag, null) is documented to remove the
-            // attribute, but for charset-prefixed string tags (notably TAG_USER_COMMENT) and
-            // some structured tags, the underlying bytes can survive a null clear and
-            // re-appear on the next read. Belt-and-braces: write null AND an empty string
-            // for known sticky string tags.
             val stickyStringTags = setOf(
                 ExifInterface.TAG_USER_COMMENT,
                 ExifInterface.TAG_ARTIST,
@@ -685,24 +678,7 @@ object PhotoCleaner {
             null
         }
     }
-
-    /**
-     * Full-resolution, format-preserving, orientation-preserving in-place clean path used by
-     * the Library Monitor bulk-clean flow. Unlike [scrubImage]'s bitmap fallback this NEVER
-     * downscales and NEVER silently drops orientation, because the output is written back over
-     * the user's original file rather than saved as a separate share copy.
-     *
-     * Returns a [ScrubResult] whose [ScrubResult.file] is a cleaned temp file at full resolution.
-     * The caller writes those bytes back to the original Uri (see [saveToUri]) and deletes the temp.
-     *
-     * Per-format strategy:
-     *  - JPEG (incl. XMP/IPTC): truly lossless. EXIF blacklist strip (orientation preserved) +
-     *    commons-imaging XMP/IPTC segment removal. No pixel decode.
-     *  - HEIC/HEIF: near-lossless full-res re-encode via [HeifWriter] at max quality, orientation
-     *    baked into pixels. Falls back to a high-quality JPEG when the device cannot HEIC-encode.
-     *    NOTE: keep-flags for embedded metadata cannot be honoured on the HEIC re-encode path.
-     *  - WebP/PNG: full-res recompress in the same (lossless) format, orientation baked in.
-     */
+    
     fun scrubInPlaceFullRes(
         context: Context,
         uri: Uri,
@@ -745,14 +721,11 @@ object PhotoCleaner {
         }
     }
 
-    /** Lossless JPEG clean: EXIF blacklist strip (orientation kept) + XMP/IPTC segment removal. */
     private fun stripJpegLosslessFullRes(
         context: Context,
         uri: Uri,
         options: ScrubbingOptions
     ): File? {
-        // EXIF blacklist strip into a temp file. SENSITIVE_TAGS excludes TAG_ORIENTATION, so
-        // orientation survives untouched and no pixels are decoded.
         val exifStripped = stripMetadataLossless(context, uri, options) ?: return null
 
         val intermediates = mutableListOf<File>()
@@ -773,7 +746,6 @@ object PhotoCleaner {
             current = out
         }
 
-        // If the user opted to keep specific XMP/IPTC fields, re-apply only those.
         val result = if (options.keepEmbeddedMetadata) {
             reApplyEmbeddedMetadata(context, uri, current, options)?.also {
                 if (it != current) intermediates.add(current)
@@ -786,7 +758,6 @@ object PhotoCleaner {
         return result
     }
 
-    /** HEIC/HEIF clean: full-res re-encode via HeifWriter at max quality, orientation baked in. */
     private fun stripHeicFullRes(
         context: Context,
         uri: Uri,
@@ -818,7 +789,6 @@ object PhotoCleaner {
         }
     }
 
-    /** Full-res recompress for WebP/PNG (and any other decodable raster) in the same format. */
     private fun stripBitmapFullRes(
         context: Context,
         uri: Uri,
@@ -836,7 +806,6 @@ object PhotoCleaner {
         return compressBitmapToTemp(context, bitmap, format, ext)
     }
 
-    /** Decode at full resolution, then re-encode as a near-lossless JPEG (HEIC/encode fallback). */
     private fun stripBitmapToJpegFullRes(context: Context, uri: Uri): File? {
         val bitmap = decodeUprightBitmap(context, uri) ?: return null
         return compressBitmapToTemp(context, bitmap, Bitmap.CompressFormat.JPEG, "jpg")
@@ -861,13 +830,8 @@ object PhotoCleaner {
         }
     }
 
-    /** Full-resolution decode with EXIF orientation baked into the pixels (no downscaling). */
     private fun decodeUprightBitmap(context: Context, uri: Uri): Bitmap? {
         val resolver = context.contentResolver
-        // Measure bounds first so we can cap the decode to the device's memory budget — the same
-        // guard the single-photo flow uses. Without it, full-res decode of large PNG/WebP/TIFF/HEIC
-        // images OOMs on low-memory devices (the photo is then skipped, never cleaned) and the
-        // oversized allocations thrash GC across large library cleans, slowing the whole batch.
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         val maxDimension = calculateAdaptiveMaxDimension(context)
@@ -1163,23 +1127,13 @@ object PhotoCleaner {
         }
         return inSampleSize
     }
-
-    /**
-     * Cheap check: can [uri] be decoded as a valid image? Uses a bounds-only decode (no pixel
-     * allocation) — a corrupt, truncated, or non-image file yields non-positive dimensions. Used by
-     * the audit to separate genuinely unreadable files from clean photos that merely lack metadata.
-     */
+    
     private fun isDecodableImage(context: Context, uri: Uri): Boolean = runCatching {
         val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
         opts.outWidth > 0 && opts.outHeight > 0
     }.getOrDefault(false)
 
-    /**
-     * Public, cheap decodability probe: true when [uri] is a valid, decodable image. Lets callers
-     * (e.g. the Storage Audit bulk clean) skip corrupt/unreadable files *before* requesting write
-     * consent, so the system consent dialog count reflects only files that can actually be cleaned.
-     */
     fun isReadableImage(context: Context, uri: Uri): Boolean = isDecodableImage(context, uri)
 
     private fun calculateAdaptiveMaxDimension(context: Context): Int {
@@ -1339,16 +1293,6 @@ object PhotoCleaner {
                     sizeStr = formatFileSize(size)
                 }
             }
-
-            // (Previously had a Log.d("VantreFUSE", "diagnose($uri): …") here that
-            // ran on every audit and logged the photo URI to logcat. Removed for
-            // release — URIs are PII (especially MediaStore IDs that can be
-            // re-resolved to filesystem paths) and we don't need this diagnostic
-            // in production. Re-add locally during debugging if a GPS-recovery
-            // regression surfaces on Android 11+ FUSE redaction.)
-            // Can the file actually be decoded as an image? A corrupt/truncated file (or a non-image
-            // with an image MIME) reads zero metadata and would otherwise look identical to a clean
-            // photo. Flag it so the audit counts it separately instead of as "clean".
             val unreadable = !isDecodableImage(context, uri)
 
             val exifSources = loadExifInterfaces(context, uri)
@@ -1539,18 +1483,7 @@ object PhotoCleaner {
 
         return exifSources
     }
-
-    /**
-     * Resolves the actual file system path from a content URI.
-     * This bypasses Android's GPS redaction layer which strips location metadata
-     * from streams and file descriptors obtained through content providers.
-     *
-     * Handles:
-     * - MediaDocumentsProvider  (content://com.android.providers.media.documents/...)
-     * - ExternalStorageProvider (content://com.android.externalstorage.documents/...)
-     * - MediaStore URIs         (content://media/external/images/media/123)
-     * - file:// URIs
-     */
+    
     private fun resolveFilePath(context: Context, uri: Uri): String? {
         // Direct file URI
         if (uri.scheme == ContentResolver.SCHEME_FILE) {

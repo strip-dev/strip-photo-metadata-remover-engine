@@ -29,18 +29,14 @@ android {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
-    implementation(libs.androidx.appcompat)
-    implementation(libs.material)
     testImplementation(libs.junit)
+    
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     
     implementation("androidx.exifinterface:exifinterface:1.3.6")
-
-    // Metadata deep reading
+    implementation("androidx.heifwriter:heifwriter:1.0.0")
     implementation("com.drewnoakes:metadata-extractor:2.19.0")
     implementation("org.apache.commons:commons-imaging:1.0.0-alpha5")
-
-    // Needed for Uri, ContentResolver, Bitmap, etc.
     implementation("androidx.annotation:annotation:1.6.0")
 }
